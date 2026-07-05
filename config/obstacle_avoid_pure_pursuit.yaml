@@ -9,6 +9,8 @@ obstacle_avoid_pure_pursuit:
     target_speed: 0.15
     max_angular_speed: 1.2
     goal_tolerance: 0.08
+    goal_yaw_tolerance: 0.08
+    goal_yaw_gain: 1.5
 
     robot_radius: 0.18
     safety_margin: 0.07

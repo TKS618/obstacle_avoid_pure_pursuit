@@ -18,11 +18,23 @@ using namespace std::chrono_literals;
 namespace
 {
 
-struct Point2
+struct Point2D
 {
   double x = 0.0;
   double y = 0.0;
+  double theta = 0.0;
 };
+
+double normalize_angle(double angle)
+{
+  while (angle > M_PI) {
+    angle -= 2.0 * M_PI;
+  }
+  while (angle < -M_PI) {
+    angle += 2.0 * M_PI;
+  }
+  return angle;
+}
 
 double yaw_from_quaternion(const geometry_msgs::msg::Quaternion & q)
 {
@@ -36,18 +48,25 @@ double clamp(double value, double min_value, double max_value)
   return std::max(min_value, std::min(value, max_value));
 }
 
-double distance(const Point2 & a, const Point2 & b)
+double distance(const Point2D & a, const Point2D & b)
 {
   return std::hypot(a.x - b.x, a.y - b.y);
 }
 
-Point2 transform_to_base(double world_x, double world_y, double robot_x, double robot_y, double robot_yaw)
+Point2D transform_to_base(
+  double world_x,
+  double world_y,
+  double world_yaw,
+  double robot_x,
+  double robot_y,
+  double robot_yaw)
 {
   const double dx = world_x - robot_x;
   const double dy = world_y - robot_y;
   return {
     std::cos(robot_yaw) * dx + std::sin(robot_yaw) * dy,
-    -std::sin(robot_yaw) * dx + std::cos(robot_yaw) * dy};
+    -std::sin(robot_yaw) * dx + std::cos(robot_yaw) * dy,
+    normalize_angle(world_yaw - robot_yaw)};
 }
 
 }  // namespace
@@ -67,6 +86,8 @@ public:
     target_speed_ = declare_parameter("target_speed", 0.15);
     max_angular_speed_ = declare_parameter("max_angular_speed", 1.2);
     goal_tolerance_ = declare_parameter("goal_tolerance", 0.08);
+    goal_yaw_tolerance_ = declare_parameter("goal_yaw_tolerance", 0.08);
+    goal_yaw_gain_ = declare_parameter("goal_yaw_gain", 1.5);
     robot_radius_ = declare_parameter("robot_radius", 0.18);
     safety_margin_ = declare_parameter("safety_margin", 0.07);
 
@@ -143,7 +164,7 @@ private:
       }
 
       const double angle = msg->angle_min + static_cast<double>(i) * msg->angle_increment;
-      Point2 p{range * std::cos(angle), range * std::sin(angle)};
+      Point2D p{range * std::cos(angle), range * std::sin(angle), angle};
       scan_points_.push_back(p);
 
       if (std::abs(angle) <= half_front_angle && range <= front_check_distance_ &&
@@ -165,21 +186,22 @@ private:
       return;
     }
 
-    if (goal_reached()) {
-      publish_stop();
+    if (goal_position_reached()) {
+      cmd_pub_->publish(goal_yaw_command());
       return;
     }
-
+    // /pathからlookahead_distance前にある点を探索
     const auto ref_target = get_lookahead_point();
     if (!ref_target) {
       publish_stop();
       return;
     }
-
-    Point2 target = *ref_target;
+    
+    Point2D target = *ref_target;
     if (nearest_front_obstacle_) {
-      const auto candidates = get_avoidance_candidates(*nearest_front_obstacle_);
-      const auto avoid_target = select_safe_target(candidates, *ref_target);
+      // 前方障害物あり
+      const auto candidates = get_avoidance_candidates(*nearest_front_obstacle_);//回避点候補
+      const auto avoid_target = select_safe_target(candidates, *ref_target);//回避目標点の決定
       if (!avoid_target) {
         RCLCPP_WARN_THROTTLE(
           get_logger(), *get_clock(), 1000,
@@ -210,7 +232,7 @@ private:
     return odom_fresh && scan_fresh && has_path_;
   }
 
-  bool goal_reached() const
+  bool goal_position_reached() const
   {
     if (path_.poses.empty()) {
       return false;
@@ -219,7 +241,24 @@ private:
     return std::hypot(goal.x - robot_x_, goal.y - robot_y_) <= goal_tolerance_;
   }
 
-  std::optional<Point2> get_lookahead_point() const
+  geometry_msgs::msg::Twist goal_yaw_command() const
+  {
+    geometry_msgs::msg::Twist cmd;
+    if (path_.poses.empty()) {
+      return cmd;
+    }
+
+    const double goal_yaw = yaw_from_quaternion(path_.poses.back().pose.orientation);
+    const double yaw_error = normalize_angle(goal_yaw - robot_yaw_);
+    if (std::abs(yaw_error) <= goal_yaw_tolerance_) {
+      return cmd;
+    }
+
+    cmd.angular.z = clamp(goal_yaw_gain_ * yaw_error, -max_angular_speed_, max_angular_speed_);
+    return cmd;
+  }
+
+  std::optional<Point2D> get_lookahead_point() const
   {
     if (path_.poses.empty()) {
       return std::nullopt;
@@ -237,53 +276,65 @@ private:
     }
 
     for (size_t i = closest_index; i < path_.poses.size(); ++i) {
-      const auto & p = path_.poses[i].pose.position;
-      const Point2 base = transform_to_base(p.x, p.y, robot_x_, robot_y_, robot_yaw_);
+      const auto & pose = path_.poses[i].pose;
+      const double yaw = yaw_from_quaternion(pose.orientation);
+      const Point2D base = transform_to_base(
+        pose.position.x, pose.position.y, yaw, robot_x_, robot_y_, robot_yaw_);
       if (base.x > 0.0 && std::hypot(base.x, base.y) >= lookahead_distance_) {
         return base;
       }
     }
 
-    const auto & last = path_.poses.back().pose.position;
-    return transform_to_base(last.x, last.y, robot_x_, robot_y_, robot_yaw_);
+    const auto & last_pose = path_.poses.back().pose;
+    const double yaw = yaw_from_quaternion(last_pose.orientation);
+    return transform_to_base(
+      last_pose.position.x, last_pose.position.y, yaw, robot_x_, robot_y_, robot_yaw_);
   }
 
-  std::vector<Point2> get_avoidance_candidates(const Point2 & obstacle) const
+  std::vector<Point2D> get_avoidance_candidates(const Point2D & obstacle) const
   {
-    std::vector<Point2> candidates;
-    const double d = std::hypot(obstacle.x, obstacle.y);
+    std::vector<Point2D> candidates;
+    const double obstacle_dist = std::hypot(obstacle.x, obstacle.y);
 
-    if (d > 1e-6 && d <= lookahead_distance_ + avoidance_radius_ &&
-      d >= std::abs(lookahead_distance_ - avoidance_radius_))
+    // 円の交差条件
+    if (obstacle_dist > 1e-6 && obstacle_dist <= lookahead_distance_ + avoidance_radius_ &&
+      obstacle_dist >= std::abs(lookahead_distance_ - avoidance_radius_))
     {
-      const double a =
-        (lookahead_distance_ * lookahead_distance_ - avoidance_radius_ * avoidance_radius_ + d * d) /
+      const double a = 
+        (lookahead_distance_ * lookahead_distance_ - avoidance_radius_ * avoidance_radius_ + obstacle_dist * obstacle_dist) /
         (2.0 * d);
       const double h_sq = lookahead_distance_ * lookahead_distance_ - a * a;
       if (h_sq >= 0.0) {
         const double h = std::sqrt(h_sq);
-        const double ux = obstacle.x / d;
-        const double uy = obstacle.y / d;
-        const Point2 foot{a * ux, a * uy};
-        candidates.push_back({foot.x - h * uy, foot.y + h * ux});
-        candidates.push_back({foot.x + h * uy, foot.y - h * ux});
+        const double ux = obstacle.x / obstacle_dist;
+        const double uy = obstacle.y / obstacle_dist;
+        const Point2D foot{a * ux, a * uy, 0.0};
+        candidates.push_back({
+          foot.x - h * uy,
+          foot.y + h * ux,
+          std::atan2(foot.y + h * ux, foot.x - h * uy)});
+        candidates.push_back({
+          foot.x + h * uy,
+          foot.y - h * ux,
+          std::atan2(foot.y - h * ux, foot.x + h * uy)});
       }
     }
-
     if (candidates.empty()) {
       const double side = obstacle.y >= 0.0 ? -1.0 : 1.0;
       const double angle = side * 70.0 * M_PI / 180.0;
-      candidates.push_back({lookahead_distance_ * std::cos(angle), lookahead_distance_ * std::sin(angle)});
+      candidates.push_back({
+        lookahead_distance_ * std::cos(angle),
+        lookahead_distance_ * std::sin(angle),
+        angle});
     }
-
     return candidates;
   }
 
-  std::optional<Point2> select_safe_target(
-    const std::vector<Point2> & candidates,
-    const Point2 & ref_target) const
+  std::optional<Point2D> select_safe_target(
+    const std::vector<Point2D> & candidates,
+    const Point2D & ref_target) const
   {
-    std::optional<Point2> best;
+    std::optional<Point2D> best;
     double best_score = std::numeric_limits<double>::infinity();
 
     for (const auto & candidate : candidates) {
@@ -305,7 +356,7 @@ private:
     return best;
   }
 
-  bool collision_check_to_target(const Point2 & target) const
+  bool collision_check_to_target(const Point2D & target) const
   {
     const double target_dist = std::hypot(target.x, target.y);
     const int steps = std::max(1, static_cast<int>(std::ceil(target_dist / line_check_step_)));
@@ -313,7 +364,7 @@ private:
 
     for (int i = 1; i <= steps; ++i) {
       const double ratio = static_cast<double>(i) / static_cast<double>(steps);
-      const Point2 sample{target.x * ratio, target.y * ratio};
+      const Point2D sample{target.x * ratio, target.y * ratio, target.theta};
       for (const auto & obstacle : scan_points_) {
         if (distance(sample, obstacle) <= clearance) {
           return true;
@@ -324,7 +375,7 @@ private:
     return false;
   }
 
-  geometry_msgs::msg::Twist pure_pursuit_command(const Point2 & target) const
+  geometry_msgs::msg::Twist pure_pursuit_command(const Point2D & target) const
   {
     geometry_msgs::msg::Twist cmd;
     const double ld = std::max(0.05, std::hypot(target.x, target.y));
@@ -380,14 +431,16 @@ private:
   rclcpp::TimerBase::SharedPtr timer_;
 
   nav_msgs::msg::Path path_;
-  std::vector<Point2> scan_points_;
-  std::optional<Point2> nearest_front_obstacle_;
-  std::optional<Point2> last_target_;
+  std::vector<Point2D> scan_points_;
+  std::optional<Point2D> nearest_front_obstacle_;
+  std::optional<Point2D> last_target_;
 
   double lookahead_distance_ = 0.4;
   double target_speed_ = 0.15;
   double max_angular_speed_ = 1.2;
   double goal_tolerance_ = 0.08;
+  double goal_yaw_tolerance_ = 0.08;
+  double goal_yaw_gain_ = 1.5;
   double robot_radius_ = 0.18;
   double safety_margin_ = 0.07;
   double front_check_distance_ = 0.6;
