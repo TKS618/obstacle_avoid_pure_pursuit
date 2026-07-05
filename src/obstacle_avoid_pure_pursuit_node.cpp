@@ -300,14 +300,17 @@ private:
     if (obstacle_dist > 1e-6 && obstacle_dist <= lookahead_distance_ + avoidance_radius_ &&
       obstacle_dist >= std::abs(lookahead_distance_ - avoidance_radius_))
     {
+      // 円の交差点x座標
       const double a = 
         (lookahead_distance_ * lookahead_distance_ - avoidance_radius_ * avoidance_radius_ + obstacle_dist * obstacle_dist) /
-        (2.0 * d);
+        (2.0 * obstacle_dist);
+      // 円の交差点y座標**2
       const double h_sq = lookahead_distance_ * lookahead_distance_ - a * a;
       if (h_sq >= 0.0) {
         const double h = std::sqrt(h_sq);
-        const double ux = obstacle.x / obstacle_dist;
-        const double uy = obstacle.y / obstacle_dist;
+        const double ux = obstacle.x / obstacle_dist;//ロボット座標系単位方向x
+        const double uy = obstacle.y / obstacle_dist;//ロボット座標系単位方向y
+        //障害物方向ベクトルu, 鉛直方向ベクトルn=(-uy, ux)
         const Point2D foot{a * ux, a * uy, 0.0};
         candidates.push_back({
           foot.x - h * uy,
@@ -319,6 +322,7 @@ private:
           std::atan2(foot.y - h * ux, foot.x + h * uy)});
       }
     }
+    // 円が作成されないとき, +-70度方向に回避
     if (candidates.empty()) {
       const double side = obstacle.y >= 0.0 ? -1.0 : 1.0;
       const double angle = side * 70.0 * M_PI / 180.0;
@@ -336,23 +340,19 @@ private:
   {
     std::optional<Point2D> best;
     double best_score = std::numeric_limits<double>::infinity();
-
     for (const auto & candidate : candidates) {
       if (candidate.x <= 0.03 || collision_check_to_target(candidate)) {
         continue;
       }
-
       double score = distance(candidate, ref_target);
       if (last_target_) {
         score += 0.25 * distance(candidate, *last_target_);
       }
-
       if (score < best_score) {
         best_score = score;
         best = candidate;
       }
     }
-
     return best;
   }
 
