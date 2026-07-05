@@ -1,0 +1,27 @@
+obstacle_avoid_pure_pursuit:
+  ros__parameters:
+    odom_topic: /odom
+    path_topic: /path
+    scan_topic: /scan
+    cmd_vel_topic: /cmd_vel
+
+    lookahead_distance: 0.4
+    target_speed: 0.15
+    max_angular_speed: 1.2
+    goal_tolerance: 0.08
+
+    robot_radius: 0.18
+    safety_margin: 0.07
+
+    front_check_distance: 0.6
+    front_check_angle_deg: 120.0
+    obstacle_consider_distance: 1.2
+    avoidance_radius: 0.45
+
+    line_check_step: 0.05
+    prediction_time: 1.2
+    prediction_dt: 0.05
+
+    odom_timeout_sec: 0.5
+    scan_timeout_sec: 0.5
+    controller_rate_hz: 20.0
