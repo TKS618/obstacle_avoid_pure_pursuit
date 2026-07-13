@@ -12,6 +12,7 @@
 #include "nav_msgs/msg/path.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/laser_scan.hpp"
+#include "rclcpp_components/register_node_macro.hpp"
 
 using namespace std::chrono_literals;
 
@@ -73,8 +74,9 @@ Point2D transform_to_base(
 class ObstacleAvoidPurePursuit : public rclcpp::Node
 {
 public:
-  ObstacleAvoidPurePursuit()
-  : Node("obstacle_avoid_pure_pursuit")
+  ObstacleAvoidPurePursuit(
+  const rclcpp::NodeOptions & options = rclcpp::NodeOptions())
+  : Node("obstacle_avoid_pure_pursuit", options)
   {
     odom_topic_ = declare_parameter("odom_topic", "/odom");
     path_topic_ = declare_parameter("path_topic", "/path");
@@ -240,8 +242,10 @@ private:
     if (path_.poses.empty()) {
       return std::nullopt;
     }
+
     size_t closest_index = 0;
     double closest_dist = std::numeric_limits<double>::infinity();
+
     for (size_t i = 0; i < path_.poses.size(); ++i) {
       const auto & p = path_.poses[i].pose.position;
       const double d = std::hypot(p.x - robot_x_, p.y - robot_y_);
@@ -250,19 +254,31 @@ private:
         closest_index = i;
       }
     }
-    for (size_t i = closest_index; i < path_.poses.size(); ++i) {
+
+    // 一番近いwaypointから3つ目から探索
+    const size_t search_start_index =
+      closest_index >= 3 ? closest_index + 3 : 0;
+
+    for (size_t i = search_start_index; i < path_.poses.size(); ++i) {
       const auto & pose = path_.poses[i].pose;
       const double yaw = yaw_from_quaternion(pose.orientation);
+
       const Point2D base = transform_to_base(
-        pose.position.x, pose.position.y, yaw, robot_x_, robot_y_, robot_yaw_);
+        pose.position.x, pose.position.y, yaw,
+        robot_x_, robot_y_, robot_yaw_);
+
+      // ロボット前方かつlookahead距離以上の点だけ採用
       if (base.x > 0.0 && std::hypot(base.x, base.y) >= lookahead_distance_) {
         return base;
       }
     }
+
     const auto & last_pose = path_.poses.back().pose;
     const double yaw = yaw_from_quaternion(last_pose.orientation);
+
     return transform_to_base(
-      last_pose.position.x, last_pose.position.y, yaw, robot_x_, robot_y_, robot_yaw_);
+      last_pose.position.x, last_pose.position.y, yaw,
+      robot_x_, robot_y_, robot_yaw_);
   }
   std::vector<Point2D> get_avoidance_candidates(const Point2D & obstacle) const
   {
@@ -425,10 +441,4 @@ private:
   rclcpp::Time last_scan_time_;
 };
 
-int main(int argc, char ** argv)
-{
-  rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<ObstacleAvoidPurePursuit>());
-  rclcpp::shutdown();
-  return 0;
-}
+RCLCPP_COMPONENTS_REGISTER_NODE(ObstacleAvoidPurePursuit)
