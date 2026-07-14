@@ -1,6 +1,6 @@
 obstacle_avoid_pure_pursuit:
   ros__parameters:
-    odom_topic: /odom
+    pose_topic: /pose
     path_topic: /path
     scan_topic: /scan
     cmd_vel_topic: /cmd_vel
@@ -24,6 +24,6 @@ obstacle_avoid_pure_pursuit:
     prediction_time: 1.2
     prediction_dt: 0.05
 
-    odom_timeout_sec: 0.5
+    pose_timeout_sec: 0.5
     scan_timeout_sec: 0.5
     controller_rate_hz: 20.0

@@ -7,8 +7,8 @@
 #include <string>
 #include <vector>
 
+#include "geometry_msgs/msg/pose_with_covariance_stamped.hpp"
 #include "geometry_msgs/msg/twist.hpp"
-#include "nav_msgs/msg/odometry.hpp"
 #include "nav_msgs/msg/path.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/laser_scan.hpp"
@@ -78,7 +78,7 @@ public:
   const rclcpp::NodeOptions & options = rclcpp::NodeOptions())
   : Node("obstacle_avoid_pure_pursuit", options)
   {
-    odom_topic_ = declare_parameter("odom_topic", "/odom");
+    pose_topic_ = declare_parameter("pose_topic", "/pose");
     path_topic_ = declare_parameter("path_topic", "/path");
     scan_topic_ = declare_parameter("scan_topic", "/scan");
     cmd_vel_topic_ = declare_parameter("cmd_vel_topic", "/cmd_vel");
@@ -99,13 +99,13 @@ public:
     line_check_step_ = declare_parameter("line_check_step", 0.05);
     prediction_time_ = declare_parameter("prediction_time", 1.2);
     prediction_dt_ = declare_parameter("prediction_dt", 0.05);
-    odom_timeout_sec_ = declare_parameter("odom_timeout_sec", 0.5);
+    pose_timeout_sec_ = declare_parameter("pose_timeout_sec", 0.5);
     scan_timeout_sec_ = declare_parameter("scan_timeout_sec", 0.5);
     const double controller_rate_hz = declare_parameter("controller_rate_hz", 20.0);
     cmd_pub_ = create_publisher<geometry_msgs::msg::Twist>(cmd_vel_topic_, 10);
-    odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
-      odom_topic_, rclcpp::SensorDataQoS(),
-      std::bind(&ObstacleAvoidPurePursuit::on_odom, this, std::placeholders::_1));
+    pose_sub_ = create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
+      pose_topic_, 10,
+      std::bind(&ObstacleAvoidPurePursuit::on_pose, this, std::placeholders::_1));
     path_sub_ = create_subscription<nav_msgs::msg::Path>(
       path_topic_, 10,
       std::bind(&ObstacleAvoidPurePursuit::on_path, this, std::placeholders::_1));
@@ -118,8 +118,8 @@ public:
       std::bind(&ObstacleAvoidPurePursuit::on_timer, this));
     RCLCPP_INFO(
       get_logger(),
-      "Obstacle avoidance Pure Pursuit: odom=%s path=%s scan=%s cmd_vel=%s",
-      odom_topic_.c_str(), path_topic_.c_str(), scan_topic_.c_str(), cmd_vel_topic_.c_str());
+      "Obstacle avoidance Pure Pursuit: pose=%s path=%s scan=%s cmd_vel=%s",
+      pose_topic_.c_str(), path_topic_.c_str(), scan_topic_.c_str(), cmd_vel_topic_.c_str());
   }
 
   ~ObstacleAvoidPurePursuit() override
@@ -127,13 +127,13 @@ public:
     publish_stop();
   }
 private:
-  void on_odom(const nav_msgs::msg::Odometry::SharedPtr msg)
+  void on_pose(const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg)
   {
     robot_x_ = msg->pose.pose.position.x;
     robot_y_ = msg->pose.pose.position.y;
     robot_yaw_ = yaw_from_quaternion(msg->pose.pose.orientation);
-    has_odom_ = true;
-    last_odom_time_ = now();
+    has_pose_ = true;
+    last_pose_time_ = now();
   }
   void on_path(const nav_msgs::msg::Path::SharedPtr msg)
   {
@@ -211,9 +211,9 @@ private:
   }
   bool inputs_ready() const
   {
-    const bool odom_fresh = has_odom_ && (now() - last_odom_time_).seconds() <= odom_timeout_sec_;
+    const bool pose_fresh = has_pose_ && (now() - last_pose_time_).seconds() <= pose_timeout_sec_;
     const bool scan_fresh = has_scan_ && (now() - last_scan_time_).seconds() <= scan_timeout_sec_;
-    return odom_fresh && scan_fresh && has_path_;
+    return pose_fresh && scan_fresh && has_path_;
   }
   bool goal_position_reached() const
   {
@@ -397,13 +397,13 @@ private:
     cmd_pub_->publish(cmd);
   }
 
-  std::string odom_topic_;
+  std::string pose_topic_;
   std::string path_topic_;
   std::string scan_topic_;
   std::string cmd_vel_topic_;
 
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_pub_;
-  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
+  rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr pose_sub_;
   rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr path_sub_;
   rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
   rclcpp::TimerBase::SharedPtr timer_;
@@ -428,16 +428,16 @@ private:
   double line_check_step_ = 0.05;
   double prediction_time_ = 1.2;
   double prediction_dt_ = 0.05;
-  double odom_timeout_sec_ = 0.5;
+  double pose_timeout_sec_ = 0.5;
   double scan_timeout_sec_ = 0.5;
 
-  bool has_odom_ = false;
+  bool has_pose_ = false;
   bool has_path_ = false;
   bool has_scan_ = false;
   double robot_x_ = 0.0;
   double robot_y_ = 0.0;
   double robot_yaw_ = 0.0;
-  rclcpp::Time last_odom_time_;
+  rclcpp::Time last_pose_time_;
   rclcpp::Time last_scan_time_;
 };
 
