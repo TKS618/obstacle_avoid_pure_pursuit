@@ -1,29 +1,30 @@
 obstacle_avoid_pure_pursuit:
   ros__parameters:
-    pose_topic: /pose
+    pose_topic: /mcl_pose
     path_topic: /path
     scan_topic: /scan
     cmd_vel_topic: /cmd_vel
 
     lookahead_distance: 0.4
     target_speed: 0.15
-    max_angular_speed: 1.2
+    max_angular_speed: 0.5
     goal_tolerance: 0.08
+    goal_exit_tolerance: 0.15
     goal_yaw_tolerance: 0.08
     goal_yaw_gain: 1.5
 
     robot_radius: 0.18
     safety_margin: 0.07
 
-    front_check_distance: 0.6
-    front_check_angle_deg: 120.0
-    obstacle_consider_distance: 1.2
-    avoidance_radius: 0.45
+    front_check_distance: 0.4
+    front_check_angle_deg: 60.0
+    obstacle_consider_distance: 0.4
+    avoidance_radius: 0.35
 
     line_check_step: 0.05
-    prediction_time: 1.2
+    prediction_time: 0.7
     prediction_dt: 0.05
+    avoidance_turn_speed: 0.3
 
-    pose_timeout_sec: 0.5
     scan_timeout_sec: 0.5
     controller_rate_hz: 20.0

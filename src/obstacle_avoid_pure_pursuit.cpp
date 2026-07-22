@@ -48,6 +48,17 @@ double clamp(double value, double min_value, double max_value)
   return std::max(min_value, std::min(value, max_value));
 }
 
+double continuous_angle_error(double wrapped_error, double previous_error)
+{
+  while (wrapped_error - previous_error > M_PI) {
+    wrapped_error -= 2.0 * M_PI;
+  }
+  while (wrapped_error - previous_error < -M_PI) {
+    wrapped_error += 2.0 * M_PI;
+  }
+  return wrapped_error;
+}
+
 double distance(const Point2D & a, const Point2D & b)
 {
   return std::hypot(a.x - b.x, a.y - b.y);
@@ -78,15 +89,17 @@ public:
   const rclcpp::NodeOptions & options = rclcpp::NodeOptions())
   : Node("obstacle_avoid_pure_pursuit", options)
   {
-    pose_topic_ = declare_parameter("pose_topic", "/pose");
+    pose_topic_ = declare_parameter("pose_topic", "/mcl_pose");
     path_topic_ = declare_parameter("path_topic", "/path");
     scan_topic_ = declare_parameter("scan_topic", "/scan");
     cmd_vel_topic_ = declare_parameter("cmd_vel_topic", "/cmd_vel");
 
     lookahead_distance_ = declare_parameter("lookahead_distance", 0.4);
     target_speed_ = declare_parameter("target_speed", 0.15);
-    max_angular_speed_ = declare_parameter("max_angular_speed", 1.2);
+    max_angular_speed_ = declare_parameter("max_angular_speed", 0.5);
     goal_tolerance_ = declare_parameter("goal_tolerance", 0.08);
+    goal_exit_tolerance_ = std::max(goal_tolerance_,
+      declare_parameter("goal_exit_tolerance", 0.15));
     goal_yaw_tolerance_ = declare_parameter("goal_yaw_tolerance", 0.08);
     goal_yaw_gain_ = declare_parameter("goal_yaw_gain", 1.5);
     robot_radius_ = declare_parameter("robot_radius", 0.18);
@@ -95,11 +108,13 @@ public:
     front_check_distance_ = declare_parameter("front_check_distance", 0.6);
     front_check_angle_deg_ = declare_parameter("front_check_angle_deg", 120.0);
     obstacle_consider_distance_ = declare_parameter("obstacle_consider_distance", 1.2);
-    avoidance_radius_ = declare_parameter("avoidance_radius", 0.45);
+    avoidance_radius_ = std::max(
+      declare_parameter("avoidance_radius", 0.35),
+      robot_radius_ + safety_margin_ + 0.05);
     line_check_step_ = declare_parameter("line_check_step", 0.05);
-    prediction_time_ = declare_parameter("prediction_time", 1.2);
+    prediction_time_ = declare_parameter("prediction_time", 0.7);
+    avoidance_turn_speed_ = declare_parameter("avoidance_turn_speed", 0.3);
     prediction_dt_ = declare_parameter("prediction_dt", 0.05);
-    pose_timeout_sec_ = declare_parameter("pose_timeout_sec", 0.5);
     scan_timeout_sec_ = declare_parameter("scan_timeout_sec", 0.5);
     const double controller_rate_hz = declare_parameter("controller_rate_hz", 20.0);
     cmd_pub_ = create_publisher<geometry_msgs::msg::Twist>(cmd_vel_topic_, 10);
@@ -133,12 +148,29 @@ private:
     robot_y_ = msg->pose.pose.position.y;
     robot_yaw_ = yaw_from_quaternion(msg->pose.pose.orientation);
     has_pose_ = true;
-    last_pose_time_ = now();
   }
   void on_path(const nav_msgs::msg::Path::SharedPtr msg)
   {
+    bool goal_changed = path_.poses.empty() != msg->poses.empty();
+    if (!path_.poses.empty() && !msg->poses.empty()) {
+      const auto & old_goal = path_.poses.back().pose;
+      const auto & new_goal = msg->poses.back().pose;
+      const double position_change = std::hypot(
+        new_goal.position.x - old_goal.position.x,
+        new_goal.position.y - old_goal.position.y);
+      const double yaw_change = std::abs(normalize_angle(
+        yaw_from_quaternion(new_goal.orientation) -
+        yaw_from_quaternion(old_goal.orientation)));
+      goal_changed = position_change > 1e-6 || yaw_change > 1e-6;
+    }
     path_ = *msg;
     has_path_ = !path_.poses.empty();
+    if (goal_changed) {
+      goal_position_mode_ = false;
+      goal_yaw_active_ = false;
+      goal_yaw_complete_ = false;
+      RCLCPP_INFO(get_logger(), "Received a new path goal; resetting goal state");
+    }
   }
   void on_scan(const sensor_msgs::msg::LaserScan::SharedPtr msg)
   {
@@ -174,10 +206,25 @@ private:
       publish_stop();
       return;
     }
-    if (goal_position_reached()) {
-      cmd_pub_->publish(goal_yaw_command());
-      return;
+    if (!goal_position_mode_ && goal_position_reached()) {
+      goal_position_mode_ = true;
+      RCLCPP_INFO(get_logger(), "Goal position reached; entering yaw alignment mode");
     }
+    if (goal_position_mode_) {
+      const auto & goal = path_.poses.back().pose.position;
+      const double goal_distance = std::hypot(goal.x - robot_x_, goal.y - robot_y_);
+      if (!goal_yaw_complete_ && goal_distance > goal_exit_tolerance_) {
+        goal_position_mode_ = false;
+        goal_yaw_active_ = false;
+        RCLCPP_WARN(get_logger(),
+          "Left goal position by %.3f m; returning to path control", goal_distance);
+      } else {
+        cmd_pub_->publish(goal_yaw_command());
+        return;
+      }
+    }
+    goal_yaw_active_ = false;
+    goal_yaw_complete_ = false;
     // /pathからlookahead_distance前にある点を探索
     const auto ref_target = get_lookahead_point();
     if (!ref_target) {
@@ -200,20 +247,29 @@ private:
     }
     auto cmd = pure_pursuit_command(target);
     if (trajectory_collision_check(cmd)) {
+      const double target_angle = std::atan2(target.y, target.x);
+      double turn_speed = clamp(
+        1.5 * target_angle, -max_angular_speed_, max_angular_speed_);
+      if (std::abs(turn_speed) < avoidance_turn_speed_) {
+        const double turn_direction =
+          std::abs(target.y) > 1e-3 ? target.y :
+          (nearest_front_obstacle_ && nearest_front_obstacle_->y >= 0.0 ? -1.0 : 1.0);
+        turn_speed = std::copysign(avoidance_turn_speed_, turn_direction);
+      }
+      cmd.linear.x = 0.0;
+      cmd.angular.z = turn_speed;
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 1000,
-        "Predicted command collides with obstacle data. Stopping.");
-      cmd.linear.x = 0.0;
-      cmd.angular.z = 0.0;
+        "Predicted forward path is occupied; turning in place at %.3f rad/s.",
+        cmd.angular.z);
     }
     cmd_pub_->publish(cmd);
     last_target_ = target;
   }
   bool inputs_ready() const
   {
-    const bool pose_fresh = has_pose_ && (now() - last_pose_time_).seconds() <= pose_timeout_sec_;
     const bool scan_fresh = has_scan_ && (now() - last_scan_time_).seconds() <= scan_timeout_sec_;
-    return pose_fresh && scan_fresh && has_path_;
+    return has_pose_ && scan_fresh && has_path_;
   }
   bool goal_position_reached() const
   {
@@ -223,18 +279,29 @@ private:
     const auto & goal = path_.poses.back().pose.position;
     return std::hypot(goal.x - robot_x_, goal.y - robot_y_) <= goal_tolerance_;
   }
-  geometry_msgs::msg::Twist goal_yaw_command() const
+  geometry_msgs::msg::Twist goal_yaw_command()
   {
     geometry_msgs::msg::Twist cmd;
-    if (path_.poses.empty()) {
+    if (path_.poses.empty() || goal_yaw_complete_) {
       return cmd;
     }
     const double goal_yaw = yaw_from_quaternion(path_.poses.back().pose.orientation);
-    const double yaw_error = normalize_angle(goal_yaw - robot_yaw_);
+    double yaw_error = normalize_angle(goal_yaw - robot_yaw_);
+    if (!goal_yaw_active_) {
+      goal_yaw_active_ = true;
+      previous_goal_yaw_error_ = yaw_error;
+    } else {
+      yaw_error = continuous_angle_error(yaw_error, previous_goal_yaw_error_);
+      previous_goal_yaw_error_ = yaw_error;
+    }
     if (std::abs(yaw_error) <= goal_yaw_tolerance_) {
+      goal_yaw_complete_ = true;
+      goal_yaw_active_ = false;
+      RCLCPP_INFO(get_logger(), "Goal yaw reached; holding stop command");
       return cmd;
     }
-    cmd.angular.z = clamp(goal_yaw_gain_ * yaw_error, -max_angular_speed_, max_angular_speed_);
+    cmd.angular.z = clamp(
+      goal_yaw_gain_ * yaw_error, -max_angular_speed_, max_angular_speed_);
     return cmd;
   }
   std::optional<Point2D> get_lookahead_point() const
@@ -310,14 +377,17 @@ private:
           std::atan2(foot.y - h * ux, foot.x + h * uy)});
       }
     }
-    // 円が作成されないとき, +-70度方向に回避
+    // 円の交点を作れない場合も、空いている側を選べるよう左右を評価する。
     if (candidates.empty()) {
-      const double side = obstacle.y >= 0.0 ? -1.0 : 1.0;
-      const double angle = side * 70.0 * M_PI / 180.0;
+      const double angle = 70.0 * M_PI / 180.0;
       candidates.push_back({
         lookahead_distance_ * std::cos(angle),
         lookahead_distance_ * std::sin(angle),
         angle});
+      candidates.push_back({
+        lookahead_distance_ * std::cos(-angle),
+        lookahead_distance_ * std::sin(-angle),
+        -angle});
     }
     return candidates;
   }
@@ -415,8 +485,9 @@ private:
 
   double lookahead_distance_ = 0.4;
   double target_speed_ = 0.15;
-  double max_angular_speed_ = 1.2;
+  double max_angular_speed_ = 0.5;
   double goal_tolerance_ = 0.08;
+  double goal_exit_tolerance_ = 0.15;
   double goal_yaw_tolerance_ = 0.08;
   double goal_yaw_gain_ = 1.5;
   double robot_radius_ = 0.18;
@@ -424,20 +495,23 @@ private:
   double front_check_distance_ = 0.6;
   double front_check_angle_deg_ = 120.0;
   double obstacle_consider_distance_ = 1.2;
-  double avoidance_radius_ = 0.45;
+  double avoidance_radius_ = 0.35;
   double line_check_step_ = 0.05;
-  double prediction_time_ = 1.2;
+  double prediction_time_ = 0.7;
   double prediction_dt_ = 0.05;
-  double pose_timeout_sec_ = 0.5;
+  double avoidance_turn_speed_ = 0.3;
   double scan_timeout_sec_ = 0.5;
 
   bool has_pose_ = false;
   bool has_path_ = false;
   bool has_scan_ = false;
+  bool goal_position_mode_ = false;
+  bool goal_yaw_active_ = false;
+  bool goal_yaw_complete_ = false;
+  double previous_goal_yaw_error_ = 0.0;
   double robot_x_ = 0.0;
   double robot_y_ = 0.0;
   double robot_yaw_ = 0.0;
-  rclcpp::Time last_pose_time_;
   rclcpp::Time last_scan_time_;
 };
 
